@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pdf-snap demo</title>
+<!--
+  Folder layout expected (serve the PARENT folder, e.g. `npx.cmd serve .` from it):
+     some-folder/
+       pdf-viewport/
+       pdf-snap/        ← this
+  then open http://localhost:3000/pdf-snap/demo/
+-->
+<script type="importmap">
+{ "imports": {
+  "pdfjs-dist": "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.min.mjs",
+  "pdf-viewport": "../../pdf-viewport/src/index.js",
+  "pdf-snap": "../src/index.js"
+} }
+</script>
+<style>
+  html, body { margin: 0; height: 100%; font: 13px system-ui, sans-serif; }
+  body { display: grid; grid-template-rows: auto 1fr; grid-template-columns: 1fr 220px; }
+  header { grid-column: 1 / 3; display: flex; gap: 10px; align-items: center; padding: 6px 10px; background: #223c48; color: #fff; flex-wrap: wrap; }
+  header input[type=number] { width: 60px; }
+  #viewer { background: #6b7a80; cursor: crosshair; }
+  aside { background: #f4f6f7; border-left: 1px solid #ccd; padding: 8px 10px; overflow: auto; }
+  aside h4 { margin: 10px 0 4px; }
+  aside label { display: block; }
+  #stats, #readout { font-variant-numeric: tabular-nums; }
+  #readout { margin-left: auto; font-weight: 600; }
+  .muted { color: #667; }
+</style>
+</head>
+<body>
+<header>
+  <input type="file" id="file" accept="application/pdf" />
+  <button id="prev">◀</button><span id="pageLabel">–</span><button id="next">▶</button>
+  <button id="fit">Fit</button>
+  <label>Scale 1:<input type="number" id="scale" value="100" min="1" /></label>
+  <label><input type="checkbox" id="snapOn" checked /> Snap (F3)</label>
+  <span id="readout"></span>
+</header>
+<div id="viewer"></div>
+<aside>
+  <div class="muted">
+    <b>Measure:</b> click to add points · double-click / Enter to finish · Esc cancel · Backspace undo ·
+    hold <b>Shift</b> for ortho (0/45/90°) · middle-drag pans · wheel zooms
+  </div>
+  <h4>Snap to</h4>
+  <div id="kinds"></div>
+  <h4>PDF layers</h4>
+  <div id="layers" class="muted">–</div>
+  <h4>Linework</h4>
+  <div id="stats" class="muted">–</div>
+</aside>
+
+<script type="module">
+import * as pdfjsLib from 'pdfjs-dist';
+import { PdfViewport } from 'pdf-viewport';
+import { PdfSnapper, constrainAngle } from 'pdf-snap';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.worker.min.mjs';
+
+const $ = (id) => document.getElementById(id);
+const viewerEl = $('viewer');
+const vp = new PdfViewport(viewerEl, { panButtons: [1] }); // left click = measuring
+const snapper = new PdfSnapper(vp, { OPS: pdfjsLib.OPS, radiusPx: 12 });
+window.vp = vp; window.snapper = snapper;
+
+// ---- snap kind toggles
+const KINDS = ['endpoint', 'intersection', 'midpoint', 'center', 'perpendicular', 'nearest', 'extra'];
+const LABEL = { endpoint: '□ Endpoint', intersection: '✕ Intersection', midpoint: '△ Midpoint', center: '○ Centre',
+  perpendicular: '⊾ Perpendicular', nearest: '⧗ Nearest', extra: '◇ My points' };
+for (const k of KINDS) $('kinds').insertAdjacentHTML('beforeend', `<label><input type="checkbox" data-k="${k}" checked> ${LABEL[k]}</label>`);
+$('kinds').onchange = () => (snapper.opts.kinds = [...$('kinds').querySelectorAll('input:checked')].map((i) => i.dataset.k));
+
+// ---- document / pages
+let task = null, doc = null, pageNo = 1;
+async function open(data) {
+  await task?.destroy(); // free the previous document (pdf.js 6: destroy lives on the loading task)
+  task = pdfjsLib.getDocument({ data });
+  doc = await task.promise;
+  pageNo = 1;
+  await show();
+}
+async function show() {
+  const page = await doc.getPage(pageNo);
+  $('pageLabel').textContent = `${pageNo} / ${doc.numPages}`;
+  measures.length = 0; current = []; redraw();
+  await vp.setPage(page);
+  $('stats').textContent = 'extracting…';
+  const s = await snapper.setPage(page);
+  $('stats').innerHTML = `${s.polylines.toLocaleString()} polylines<br>${s.segments.toLocaleString()} segments<br>${s.circles} circles<br>`
+    + `opList ${s.operatorListMs} ms · extract+index ${s.extractMs} ms (${s.where})${s.truncated ? '<br><b>truncated</b>' : ''}`;
+  await listLayers(s);
+}
+async function listLayers() {
+  const el = $('layers');
+  const ids = [...new Set(snapper.engine.geom.layers.flat())];
+  if (!ids.length) { el.textContent = 'none'; return; }
+  let cfg = null;
+  try { cfg = await doc.getOptionalContentConfig(); } catch {}
+  el.innerHTML = '';
+  for (const id of ids) {
+    const name = cfg?.getGroup?.(id)?.name ?? id;
+    el.insertAdjacentHTML('beforeend', `<label><input type="checkbox" checked data-id="${id}"> ${name}</label>`);
+  }
+  el.onchange = (e) => {
+    const id = e.target.dataset.id;
+    e.target.checked ? snapper.hiddenOc.delete(id) : snapper.hiddenOc.add(id);
+    // (to also hide it visually: cfg.setVisibility(id, checked) and vp.invalidate({optionalContentConfigPromise: Promise.resolve(cfg)}))
+  };
+}
+$('file').onchange = async (e) => { const f = e.target.files[0]; if (f) open(new Uint8Array(await f.arrayBuffer())); };
+viewerEl.ondragover = (e) => e.preventDefault();
+viewerEl.ondrop = async (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) open(new Uint8Array(await f.arrayBuffer())); };
+$('prev').onclick = () => doc && pageNo > 1 && (pageNo--, show());
+$('next').onclick = () => doc && pageNo < doc.numPages && (pageNo++, show());
+$('fit').onclick = () => vp.fitPage();
+$('snapOn').onchange = (e) => { snapper.enabled = e.target.checked; snapper.clearMarker(); };
+
+// ---- measuring tool (polyline length) — everything stored in PDF units
+const SVG = 'http://www.w3.org/2000/svg';
+const layer = document.createElementNS(SVG, 'g');
+vp.overlayGroup.insertBefore(layer, vp.overlayGroup.firstChild); // under the snap marker
+const measures = []; // arrays of {x,y} in PDF units
+let current = [];
+let cursor = null; // PDF units
+
+const metres = (pts) => {
+  let L = 0;
+  for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  return (L * 25.4 / 72) * Number($('scale').value) / 1000; // points → mm on paper → m at scale
+};
+function pointFromEvent(e) {
+  const hit = snapper.snapClient(e.clientX, e.clientY, {
+    from: current.length ? vp.pdfToPage(current.at(-1).x, current.at(-1).y) : undefined,
+  });
+  if (hit) return hit.pdf;
+  const r = viewerEl.getBoundingClientRect();
+  const pg = vp.screenToPage(e.clientX - r.left, e.clientY - r.top);
+  let p = vp.pageToPdf(pg.x, pg.y);
+  if (e.shiftKey && current.length) p = constrainAngle(current.at(-1), p, 45);
+  return p;
+}
+function poly(pts, attrs) {
+  const el = document.createElementNS(SVG, 'polyline');
+  el.setAttribute('points', pts.map((p) => { const q = vp.pdfToPage(p.x, p.y); return `${q.x},${q.y}`; }).join(' '));
+  for (const [k, v] of Object.entries({ fill: 'none', 'stroke-width': 2.5, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round', ...attrs })) el.setAttribute(k, v);
+  layer.appendChild(el);
+}
+function redraw() {
+  layer.replaceChildren();
+  for (const m of measures) poly(m, { stroke: '#1e88e5' });
+  if (current.length) poly(cursor ? [...current, cursor] : current, { stroke: '#e53935', 'stroke-dasharray': '6 4' });
+  // existing measurement vertices become snap targets ("My points")
+  snapper.extraPoints = measures.flat().flatMap((p) => [p.x, p.y]);
+  const live = current.length ? metres(cursor ? [...current, cursor] : current) : null;
+  const total = measures.reduce((s, m) => s + metres(m), 0);
+  $('readout').textContent = `${live != null ? `current ${live.toFixed(3)} m · ` : ''}${measures.length} measured · total ${total.toFixed(3)} m`;
+}
+viewerEl.addEventListener('pointermove', (e) => { if (snapper.engine) { cursor = pointFromEvent(e); if (current.length) redraw(); } });
+viewerEl.addEventListener('click', (e) => { if (e.button === 0 && snapper.engine) { current.push(pointFromEvent(e)); redraw(); } });
+viewerEl.addEventListener('dblclick', () => finish());
+function finish() {
+  // dblclick also fired two clicks: drop the duplicate last point
+  const pts = current.filter((p, i) => i === 0 || Math.hypot(p.x - current[i - 1].x, p.y - current[i - 1].y) > 1e-6);
+  if (pts.length >= 2) measures.push(pts);
+  current = []; redraw();
+}
+addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') finish();
+  else if (e.key === 'Escape') { current = []; redraw(); }
+  else if (e.key === 'Backspace') { current.pop(); redraw(); }
+  else if (e.key === 'F3') { e.preventDefault(); $('snapOn').click(); }
+});
+</script>
+</body>
+</html>
